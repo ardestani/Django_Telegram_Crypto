@@ -35,8 +35,7 @@ class NOWPaymentsService:
         
         # Different endpoints use different authentication methods
         self.api_key_headers = {
-            'x-api-key': self.api_key,
-            'Content-Type': 'application/json'
+            'x-api-key': self.api_key
         }
         
         print(f"API Key Headers: {self.api_key_headers}")
@@ -145,37 +144,25 @@ class NOWPaymentsService:
             print(f"Error getting estimated price: {e}")
             return None
     
-    def create_payment(self, amount, currency_from, currency_to, order_id, order_description, sub_partner_id=None):
-        """Create a new payment"""
+    def create_payment(self, amount, currency, sub_partner_id):
+        """Create a new payment using sub-partner endpoint"""
         try:
-            data = {
-                'price_amount': amount,
-                'price_currency': currency_from,
-                'pay_currency': currency_to,
-                'order_id': str(order_id),
-                'order_description': order_description,
-                'ipn_callback_url': f"{os.getenv('BASE_URL', 'http://localhost:8000')}/api/payment/webhook/",
-                'is_fixed_rate': str(self.is_fixed_rate).lower(),
-                'is_fee_paid_by_user': str(self.is_fee_paid_by_user).lower()
+            payload = {
+                'currency': currency.lower(),  # User's chosen crypto currency
+                'amount': str(amount),  # Amount from estimate API
+                'sub_partner_id': str(sub_partner_id)  # User's sub-partner ID
             }
             
-            # Add sub-partner ID if provided
-            if sub_partner_id:
-                data['sub_partner_id'] = sub_partner_id
-                print(f"Using sub-partner ID: {sub_partner_id}")
-            else:
-                print("No sub-partner ID provided")
+            print(f"Creating payment with payload: {payload}")
+            print(f"API URL: {self.base_url}/sub-partner/payment")
             
-            print(f"Creating payment with data: {data}")
-            print(f"API URL: {self.base_url}/payment")
-            
-            response = requests.post(f"{self.base_url}/payment", json=data, headers=self.api_key_headers)
+            response = requests.post(f"{self.base_url}/sub-partner/payment", data=payload, headers=self.api_key_headers)
             
             print(f"Payment creation response status: {response.status_code}")
             print(f"Payment creation response content: {response.text}")
             
             response.raise_for_status()
-            result = response.json()
+            result = response.json()['result']
             print(f"Payment creation result: {result}")
             return result
         except requests.RequestException as e:
@@ -344,6 +331,7 @@ class PaymentProcessor:
     
     def __init__(self):
         self.nowpayments = NOWPaymentsService()
+        self.estimated_amount = None
     
     def validate_deposit_request(self, amount_usd, currency):
         """
@@ -396,6 +384,7 @@ class PaymentProcessor:
                 return False, None, f"Unable to get estimated price for {currency.upper()}"
             
             estimated_amount = estimated_data.get('estimated_amount', 0)
+            self.estimated_amount = estimated_amount
             print(f"Estimated {currency.upper()} amount: {estimated_amount}")
             
             # Convert estimated_amount to float for comparison
@@ -427,8 +416,11 @@ class PaymentProcessor:
         6. Return payment details for user
         """
         from .models import Payment
+
+        estimated_data = self.nowpayments.get_estimated_price(amount_usd, currency.lower())
+        estimated_amount = estimated_data.get('estimated_amount', 0)
         
-        print(f"Creating deposit payment: User={user.telegram_full_name}, Amount=${amount_usd}, Currency={currency}")
+        print(f"Creating deposit payment: User={user.telegram_full_name}, Amount={estimated_amount}, Currency={currency}")
         
         # Step 3-5: Validate minimum amount and get estimated price
         is_valid, estimated_data, error_message = self.validate_deposit_request(amount_usd, currency)
@@ -442,17 +434,15 @@ class PaymentProcessor:
             user=user,
             amount_usd=amount_usd,
             currency=currency,
-            expires_at=timezone.now() + timedelta(hours=24)  # 24 hour expiry
+            crypto_amount=estimated_amount,
+            expires_at=timezone.now() + timedelta(hours=3)  # 3 hour expiry
         )
         
         try:
-            # Step 6: Create NOWPayments payment (POST Deposit with payment)
+            # Step 6: Create NOWPayments payment using sub-partner endpoint
             payment_data = self.nowpayments.create_payment(
-                amount=amount_usd,
-                currency_from=currency.lower(),
-                currency_to=self.nowpayments.fiat_to.lower(),
-                order_id=payment.payment_id,
-                order_description=f"Wallet deposit for {user.telegram_full_name}",
+                amount=estimated_amount,
+                currency=currency.lower(),
                 sub_partner_id=user.nowpayments_sub_partner_id
             )
             
@@ -467,7 +457,7 @@ class PaymentProcessor:
                 print(f"Payment created successfully: {payment.payment_id} -> NOWPayments ID: {payment.nowpayments_id}")
                 return payment, payment_data, None
             else:
-                payment.delete()
+                # payment.delete()
                 error_msg = "Failed to create payment with NOWPayments"
                 print(error_msg)
                 return None, None, error_msg
@@ -482,6 +472,8 @@ class PaymentProcessor:
         """
         Step 8: Manual payment status checking (alternative to webhooks)
         """
+
+        from .models import Payment
         try:
             payment = Payment.objects.get(payment_id=payment_id)
             
@@ -512,6 +504,7 @@ class PaymentProcessor:
         Step 9: Get list of payments made to account
         This would typically be called from admin interface or for reporting
         """
+        from .models import Payment
         try:
             # Get payments from database (local payments)
             payments = Payment.objects.all().order_by('-created_at')[offset:offset+limit]
